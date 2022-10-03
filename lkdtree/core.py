@@ -5,6 +5,7 @@ try:
 except ImportError:
     from numpy import unique
 
+
 class KDTree:
     """A vanilla KDTree for comparison.
 
@@ -78,21 +79,7 @@ class KDTree:
 
         return node
 
-    def query(self, point):
-        """Find nearest-neighbour for given point.
-
-        Parameters
-        ----------
-        point :     (x, y, z) tuple
-
-        Returns
-        -------
-        dist :      int
-                    Squared distance.
-        ind :       int
-                    Index of the node.
-
-        """
+    def _query(self, point):
         # Make sure point is an array
         point = np.asarray(point)
 
@@ -108,7 +95,102 @@ class KDTree:
         # (B) collect neighbours for the other labels
         node, dist = self._reverse_search(leaf, point, dist, leaf)
 
+        return dist, node
+
+    def query(self, point):
+        """Find nearest-neighbour for given point.
+
+        Parameters
+        ----------
+        point :     (x, y, z) tuple
+
+        Returns
+        -------
+        dist :      int
+                    Squared distance.
+        ind :       int
+                    Index of the node.
+
+        """
+        dist, node = self._query(point)
+
         return dist, node.ind
+
+    def query_tree(self, other):
+        """Get nearest neighbours for points in other tree.
+
+        The strategy here is as follows:
+         1. Pick a random leaf node A1 in `other`
+         2. Find the nearest neighbour B1 in self for node A1
+         3. Go up one level from A1 and explore the other branch using the
+            parent of B1 as root for the forward search
+         4. Keep tracking back until we've reached the root of self
+         5. Pick a random leaf in the unvisited branch of root and repeat from 2
+
+        Parameters
+        ----------
+        other :     KDTree
+
+        Returns
+        -------
+        dists :     array
+        ind :       array
+
+        """
+        assert isinstance(other, KDTree)
+
+        dists = np.full(len(other), np.inf)
+        ind = np.full(len(other), -1)
+
+        # Get the first leaf node
+        A = other.root
+        while not isinstance(A, LeafNode):
+            A = A.left
+
+        # Find the closest neighbour for our neuron here
+        dist, B = self._query(A.co)
+        dists[A.ind] = dist
+        ind[A.ind] = B.ind
+
+        # Now keep walking backward
+        while True:
+            # Get parent of query branch
+            pA = A.parent
+
+            # Parent of the target branch
+            if not B == self.root:
+                pB = B.parent
+
+            # Get the other, so far unexplored sub-branch
+            ch = pA.left if pA.left != A else pA.right
+
+            # Collect distances and indices for other leaf nodes in the
+            # unexplored sub-branch
+            self._search_up(ch, pB, dists, ind)
+
+            # Stop if we reached the root
+            if pA == other.root:
+                break
+
+            A, B = pA, pB
+
+        return dists, ind
+
+    def _search_up(self, other_node, search_root, dists, ind):
+        if isinstance(other_node, LeafNode):
+            # Depth-first search for the closest leaf
+            leaf, dist = self._forward_search(search_root, other_node.co)
+
+            # Now move back and check previous branches to make sure that
+            # (A) we have the actual nearest-neighbour
+            # (B) collect neighbours for the other labels
+            node, dist = self._reverse_search(leaf, other_node.co, dist, leaf)
+
+            dists[other_node.ind] = dist
+            ind[other_node.ind] = node.ind
+        else:
+            for ch in (other_node.left, other_node.right):
+                self._search_up(ch, search_root, dists, ind)
 
     def _forward_search(self, node, point):
         self._nodes_visited += 1
@@ -307,6 +389,86 @@ class LKDTree(KDTree):
 
         # Else keep tracking back
         return self._reverse_search(p, point, dists_min, nodes_min)
+
+
+class KDForest:
+    """A collection of KDTrees that share the same cutting planes.
+
+    Parameters
+    ----------
+    points :    (N, 3) array
+    labels :    (N, ) array
+                This is assumed to be contiguous integers ranging from 0 to
+                max(labels).
+
+    """
+    def __init__(self, points, labels):
+        self.points = points
+        self.labels = labels
+
+        assert points.ndim == 2
+        assert points.shape[1] == 3
+        assert len(points) == len(labels)
+
+        # Get unique labels
+        self._unique_labels = unique(labels)
+
+        # Build tree
+        self.build()
+
+    def __len__(self):
+        return len(self.points)
+
+    def build(self):
+        """Build the tree."""
+        self.n_nodes = 0
+        self.roots = self._divide_tree(np.arange(len(self)))
+        self.nodes = {}
+
+    def _divide_tree(self, ind, i=0):
+        # Track max depth
+        self.depth = i
+        self.n_nodes += 1
+
+        # If only one node left, this is a leaf node
+        if len(ind) <= 1:
+            node = LeafNode()
+            node.ind = ind[0]
+            node.co = self.points[node.ind]
+        else:
+            node = Node()
+            # Get the median for this set of points
+            co = self.points[ind, i % 3]
+            node.cutax = i % 3
+            node.cutval = np.median(co)  # this is the bottleneck during build
+
+            # We have to make sure that the indices split into two approx
+            # evenly sized batches. Under certain circumstances the median
+            # doesn't work though. For example: if co=[3,4,4], the median will be 4
+            # and the split would be left=[3,4,4] and right=[].
+            left_ind = ind[co <= node.cutval]
+            right_ind = ind[co > node.cutval]
+
+            if not len(left_ind) or not len(right_ind):
+                node.cutval = min(co)
+                if min(co) != max(co):
+                    left_ind = ind[co <= node.cutval]
+                    right_ind = ind[co > node.cutval]
+                else:
+                    left_ind = ind[:1]
+                    right_ind = ind[1:]
+
+            # Split into left and right
+            node.left = self._divide_tree(left_ind, i + 1)
+            node.right = self._divide_tree(right_ind, i + 1)
+
+            node.left.parent = node.right.parent = node
+
+        # Track the level (for debugging only)
+        node.level = i
+
+        return node
+
 
 
 class Node:
